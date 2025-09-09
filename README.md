@@ -1,0 +1,1 @@
+This project implements a data compression framework for synchrophasor measurements based on Iteration-Enhanced Probabilistic Principal Component Analysis (IE-PPCA). The method improves upon traditional PCA/EPCA by preserving dynamic information and adaptively controlling accuracy during compression.
