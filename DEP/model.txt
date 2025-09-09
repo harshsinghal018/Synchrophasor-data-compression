@@ -1,0 +1,357 @@
+%% Step 1: Extract Data from timeseries Objects
+% -----------------------------------------------------------
+num_buses = 14;
+% Get timestamps array and number of samples
+time_vector = Vmag_PMU1.Time;
+timestamps = length(time_vector);
+
+% Initialize matrices
+V_phasor = zeros(timestamps, num_buses);
+VFreq = zeros(timestamps, num_buses);
+
+%% Step 2: Create Complex Phasors from timeseries
+% -----------------------------------------------------------
+for i = 1:num_buses
+    % Extract timeseries objects
+    Vmag_ts = eval(sprintf('Vmag_PMU%d', i)); 
+    Vang_ts = eval(sprintf('Vang_PMU%d', i)); 
+    VFreq_ts = eval(sprintf('VFreq_PMU%d', i)); 
+    
+    % Extract numeric data from timeseries
+    Vmag = double(Vmag_ts.Data(:,1)); % Ensure column vector
+    Vang = double(Vang_ts.Data(:,1)); 
+    
+    % Create complex phasor
+    V_phasor(:, i) = Vmag .* exp(1j * deg2rad(Vang)); 
+    
+    % Frequency data
+    VFreq(:, i) = double(VFreq_ts.Data(:,1)); 
+end
+
+%% Step 3: Normalize Phasor Data
+% -----------------------------------------------------------
+% Calculate mean amplitude for each bus (normalization factors)
+mean_amp = mean(abs(V_phasor), 1);
+% Store as diagonal matrix for later use
+AN = diag(mean_amp);
+% Normalize phasors
+V_normalized = V_phasor ./ mean_amp;
+
+%% Step 4: Compute Covariance Matrix (Complex)
+% -----------------------------------------------------------
+% Compute covariance matrix directly for phasor data
+C = (V_normalized' * V_normalized) / (timestamps - 1);
+
+%% Step 5: Eigenvalue Decomposition
+% -----------------------------------------------------------
+[U, D] = eig(C);
+eigenvalues = diag(D);
+[eigenvalues_sorted, idx] = sort(real(eigenvalues), 'descend'); % Use real part for sorting
+U = U(:, idx);
+
+%% Step 6: Iterative PPC Selection Based on TVE
+% -----------------------------------------------------------
+TVE_max = 0.8; % Threshold: 0.8%
+N_prime = 0;
+TVE = Inf;
+
+% Pre-allocation for speed
+reconstructed = zeros(size(V_normalized));
+
+while (TVE > TVE_max) && (N_prime < size(U, 2))
+    N_prime = N_prime + 1;
+    U_selected = U(:, 1:N_prime);
+    
+    % Calculate principal components (scores)
+    P = V_normalized * U_selected;
+    
+    % Reconstruct the data
+    reconstructed = P * U_selected';
+    reconstructed_scaled = reconstructed .* mean_amp;
+    
+    % Calculate Total Vector Error (TVE) - with protection against division by zero
+    error_values = abs(reconstructed_scaled - V_phasor) ./ (abs(V_phasor) + eps) * 100;
+    TVE = max(error_values(:));
+    
+    fprintf('With %d components, max TVE = %.4f%%\n', N_prime, TVE);
+end
+
+% Final selected matrices for voltage phasors
+U_prime = U(:, 1:N_prime);  % Matrix of selected eigenvectors
+P = V_normalized * U_prime;  % Matrix of principal components
+
+%% Step 7: Compress Frequency Data (Standard PCA)
+% -----------------------------------------------------------
+VFreq_mean = mean(VFreq, 1);
+VFreq_centered = VFreq - VFreq_mean;
+C_freq = cov(VFreq_centered);
+[U_freq, D_freq] = eig(C_freq);
+eigenvalues_freq = diag(D_freq);
+[eigenvalues_freq_sorted, idx_freq] = sort(real(eigenvalues_freq), 'descend');
+U_freq = U_freq(:, idx_freq);
+
+% Retain 95% variance
+variance = cumsum(eigenvalues_freq_sorted) / sum(eigenvalues_freq_sorted);
+N_prime_freq = find(variance >= 0.95, 1);
+if isempty(N_prime_freq)
+    N_prime_freq = length(eigenvalues_freq_sorted);
+end
+U_freq_prime = U_freq(:, 1:N_prime_freq);
+P_freq = VFreq_centered * U_freq_prime;
+
+%% Step 8: Save Compressed and Original Data
+% -----------------------------------------------------------
+% Save only the 6 required matrices as requested
+% 3 for voltage phasors
+save('compressed_voltage.mat', 'P', 'U_prime', 'AN', '-v7.3');
+% 3 for frequency
+save('compressed_frequency.mat', 'P_freq', 'U_freq_prime', 'VFreq_mean', '-v7.3');
+% Original data - just 2 matrices as requested
+save('original_data.mat', 'V_phasor', 'VFreq', '-v7.3');
+
+%% Step 9: Calculate Efficiency Metrics and Reconstructability for All PMUs
+% -----------------------------------------------------------
+% Reconstruct voltage phasors
+V_reconstructed = P * U_prime';
+V_reconstructed_scaled = V_reconstructed .* mean_amp;
+
+% Calculate final TVE for reporting
+final_TVE = max(abs(V_reconstructed_scaled - V_phasor) ./ (abs(V_phasor) + eps) * 100, [], 'all');
+
+% Reconstruct frequency
+VFreq_reconstructed = P_freq * U_freq_prime' + VFreq_mean;
+freq_error = max(abs(VFreq_reconstructed - VFreq), [], 'all');
+
+% Calculate time-based metrics for all PMUs
+window_size = min(50, floor(timestamps/10));  % Reasonable window size
+overlap = floor(window_size/2);               % 50% overlap
+step = window_size - overlap;
+num_windows = floor((timestamps - window_size) / step) + 1;
+
+time_indices = zeros(num_windows, 1);
+tve_over_time = zeros(num_windows, num_buses);
+
+for i = 1:num_windows
+    start_idx = (i-1)*step + 1;
+    end_idx = start_idx + window_size - 1;
+    if end_idx > timestamps
+        end_idx = timestamps;
+    end
+    
+    window_indices = start_idx:end_idx;
+    time_indices(i) = time_vector(floor(mean(window_indices)));
+    
+    % Calculate metrics for each PMU in this window
+    for pmu = 1:num_buses
+        % Extract window data for this PMU
+        original_window = V_phasor(window_indices, pmu);
+        reconstructed_window = V_reconstructed_scaled(window_indices, pmu);
+        
+        % Calculate TVE for this window and PMU
+        tve_over_time(i, pmu) = max(abs(reconstructed_window - original_window) ./ ...
+                          (abs(original_window) + eps) * 100);
+    end
+end
+
+% Calculate overall compression ratio
+original_size = numel(V_phasor) + numel(VFreq);
+compressed_size = numel(P) + numel(U_prime) + numel(AN) + ...
+                  numel(P_freq) + numel(U_freq_prime) + numel(VFreq_mean);
+compression_ratio = original_size / compressed_size;
+
+fprintf('\nCompression Results:\n');
+fprintf('Voltage phasors compressed using %d out of %d components (%.1f%% reduction)\n', ...
+    N_prime, num_buses, (1-N_prime/num_buses)*100);
+fprintf('Maximum TVE: %.4f%%\n', final_TVE);
+fprintf('Frequency data compressed using %d out of %d components (%.1f%% reduction)\n', ...
+    N_prime_freq, num_buses, (1-N_prime_freq/num_buses)*100);
+fprintf('Maximum frequency error: %.6f Hz\n', freq_error);
+fprintf('Overall compression ratio: %.2f:1\n', compression_ratio);
+fprintf('Compression completed successfully.\n');
+
+%% Step 10: Create Efficiency Graphs for All PMUs
+% -----------------------------------------------------------
+% Define better color schemes for original vs reconstructed data
+original_color = [0, 0.4470, 0.7410];  % Blue
+reconstructed_color = [0.8500, 0.3250, 0.0980];  % Orange
+
+% Figure 3: TVE vs Time for all PMUs
+figure('Name', 'TVE over Time for All PMUs');
+hold on;
+colormap(jet);
+colors = jet(num_buses);
+for pmu = 1:num_buses
+    plot(time_indices, tve_over_time(:, pmu), 'LineWidth', 1.5, 'Color', colors(pmu,:));
+end
+title('Total Vector Error (TVE) of All PMUs over Time');
+xlabel('Time');
+ylabel('TVE (%)');
+colorbar_h = colorbar;
+caxis([1 num_buses]);
+colorbar_h.Label.String = 'PMU Number';
+grid on;
+savefig('tve_vs_time_all_pmus.fig');
+
+% Figure 3b: Average TVE vs Time
+figure('Name', 'Average TVE over Time');
+plot(time_indices, mean(tve_over_time, 2), 'LineWidth', 2, 'Color', [0.4660, 0.6740, 0.1880]);
+title('Average Total Vector Error (TVE) of All PMUs over Time');
+xlabel('Time');
+ylabel('Average TVE (%)');
+grid on;
+savefig('avg_tve_vs_time.fig');
+
+% Figure 4: All PMUs Reconstructability - Magnitude
+figure('Name', 'PMU Magnitude Reconstruction Quality');
+subplot_rows = ceil(sqrt(num_buses));
+subplot_cols = ceil(num_buses/subplot_rows);
+
+for pmu = 1:num_buses
+    subplot(subplot_rows, subplot_cols, pmu);
+    
+    % Only plot a subset of points to avoid overcrowding the graph
+    sample_rate = max(1, floor(timestamps/500));  % Limit to ~500 points for clarity
+    sample_indices = 1:sample_rate:timestamps;
+    
+    plot(time_vector(sample_indices), abs(V_phasor(sample_indices, pmu)), '-', 'Color', original_color, 'LineWidth', 1);
+    hold on;
+    plot(time_vector(sample_indices), abs(V_reconstructed_scaled(sample_indices, pmu)), '--', 'Color', reconstructed_color, 'LineWidth', 1);
+    
+    title(sprintf('PMU %d', pmu));
+    if pmu > (subplot_rows-1)*subplot_cols  % Only add x-labels to bottom row
+        xlabel('Time');
+    end
+    if mod(pmu-1, subplot_cols) == 0  % Only add y-labels to leftmost column
+        ylabel('|V| (pu)');
+    end
+    grid on;
+    set(gca, 'FontSize', 8);  % Smaller font to fit in subplots
+    
+    % Add legend only to first subplot to avoid clutter
+    if pmu == 1
+        legend('Original', 'Reconstructed', 'Location', 'best', 'FontSize', 6);
+    end
+end
+
+sgtitle('Voltage Magnitude Reconstruction for All PMUs');
+savefig('all_pmus_magnitude_reconstruction.fig');
+
+% Figure 5: All PMUs Reconstructability - Angle
+figure('Name', 'PMU Angle Reconstruction Quality');
+
+for pmu = 1:num_buses
+    subplot(subplot_rows, subplot_cols, pmu);
+    
+    % Only plot a subset of points to avoid overcrowding the graph
+    sample_rate = max(1, floor(timestamps/500));  % Limit to ~500 points for clarity
+    sample_indices = 1:sample_rate:timestamps;
+    
+    plot(time_vector(sample_indices), angle(V_phasor(sample_indices, pmu))*180/pi, '-', 'Color', original_color, 'LineWidth', 1);
+    hold on;
+    plot(time_vector(sample_indices), angle(V_reconstructed_scaled(sample_indices, pmu))*180/pi, '--', 'Color', reconstructed_color, 'LineWidth', 1);
+    
+    title(sprintf('PMU %d', pmu));
+    if pmu > (subplot_rows-1)*subplot_cols  % Only add x-labels to bottom row
+        xlabel('Time');
+    end
+    if mod(pmu-1, subplot_cols) == 0  % Only add y-labels to leftmost column
+        ylabel('Angle (°)');
+    end
+    grid on;
+    set(gca, 'FontSize', 8);  % Smaller font to fit in subplots
+    
+    % Add legend only to first subplot to avoid clutter
+    if pmu == 1
+        legend('Original', 'Reconstructed', 'Location', 'best', 'FontSize', 6);
+    end
+end
+
+sgtitle('Voltage Angle Reconstruction for All PMUs');
+savefig('all_pmus_angle_reconstruction.fig');
+
+% Figure 6: All PMUs Reconstructability - Frequency
+figure('Name', 'PMU Frequency Reconstruction Quality');
+
+for pmu = 1:num_buses
+    subplot(subplot_rows, subplot_cols, pmu);
+    
+    % Only plot a subset of points to avoid overcrowding the graph
+    sample_rate = max(1, floor(timestamps/500));  % Limit to ~500 points for clarity
+    sample_indices = 1:sample_rate:timestamps;
+    
+    plot(time_vector(sample_indices), VFreq(sample_indices, pmu), '-', 'Color', original_color, 'LineWidth', 1);
+    hold on;
+    plot(time_vector(sample_indices), VFreq_reconstructed(sample_indices, pmu), '--', 'Color', reconstructed_color, 'LineWidth', 1);
+    
+    title(sprintf('PMU %d', pmu));
+    if pmu > (subplot_rows-1)*subplot_cols  % Only add x-labels to bottom row
+        xlabel('Time');
+    end
+    if mod(pmu-1, subplot_cols) == 0  % Only add y-labels to leftmost column
+        ylabel('Frequency (Hz)');
+    end
+    grid on;
+    set(gca, 'FontSize', 8);  % Smaller font to fit in subplots
+    
+    % Add legend only to first subplot to avoid clutter
+    if pmu == 1
+        legend('Original', 'Reconstructed', 'Location', 'best', 'FontSize', 6);
+    end
+end
+
+sgtitle('Frequency Reconstruction for All PMUs');
+savefig('all_pmus_frequency_reconstruction.fig');
+
+% Figure 7: Average Magnitude Reconstruction
+figure('Name', 'Average Magnitude Reconstruction');
+avg_original_mag = mean(abs(V_phasor), 2);
+avg_reconstructed_mag = mean(abs(V_reconstructed_scaled), 2);
+
+% Plot with a reasonable subsample rate
+sample_rate = max(1, floor(timestamps/1000));
+sample_indices = 1:sample_rate:timestamps;
+
+plot(time_vector(sample_indices), avg_original_mag(sample_indices), '-', 'Color', original_color, 'LineWidth', 1.5);
+hold on;
+plot(time_vector(sample_indices), avg_reconstructed_mag(sample_indices), '--', 'Color', reconstructed_color, 'LineWidth', 1.5);
+title('Average Voltage Magnitude Across All PMUs');
+xlabel('Time');
+ylabel('Average |V| (pu)');
+legend('Original', 'Reconstructed', 'Location', 'best');
+grid on;
+savefig('avg_magnitude_reconstruction.fig');
+
+% Figure 8: Average Angle Reconstruction
+figure('Name', 'Average Angle Reconstruction');
+% For angles, we need to handle phase wrapping carefully
+% We'll use the complex phasors and take the angle of the average phasor
+avg_original_phasor = mean(V_phasor, 2);
+avg_reconstructed_phasor = mean(V_reconstructed_scaled, 2);
+
+plot(time_vector(sample_indices), angle(avg_original_phasor(sample_indices))*180/pi, '-', 'Color', original_color, 'LineWidth', 1.5);
+hold on;
+plot(time_vector(sample_indices), angle(avg_reconstructed_phasor(sample_indices))*180/pi, '--', 'Color', reconstructed_color, 'LineWidth', 1.5);
+title('Average Voltage Angle Across All PMUs');
+xlabel('Time');
+ylabel('Average Angle (°)');
+legend('Original', 'Reconstructed', 'Location', 'best');
+grid on;
+savefig('avg_angle_reconstruction.fig');
+
+% Figure 9: Average Frequency Reconstruction
+figure('Name', 'Average Frequency Reconstruction');
+avg_original_freq = mean(VFreq, 2);
+avg_reconstructed_freq = mean(VFreq_reconstructed, 2);
+
+plot(time_vector(sample_indices), avg_original_freq(sample_indices), '-', 'Color', original_color, 'LineWidth', 1.5);
+hold on;
+plot(time_vector(sample_indices), avg_reconstructed_freq(sample_indices), '--', 'Color', reconstructed_color, 'LineWidth', 1.5);
+title('Average Frequency Across All PMUs');
+xlabel('Time');
+ylabel('Average Frequency (Hz)');
+legend('Original', 'Reconstructed', 'Location', 'best');
+grid on;
+savefig('avg_frequency_reconstruction.fig');
+
+% Save the time-based metrics for further analysis
+save('time_based_metrics.mat', 'time_indices', 'tve_over_time', '-v7.3');

@@ -1,0 +1,204 @@
+%% Reconstruction Efficiency Metrics
+% This code calculates various metrics to evaluate the quality of data reconstruction
+% from compressed PMU data without generating any graphs
+
+% Assuming we have already:
+% - Created V_phasor and VFreq (original data)
+% - Performed PCA and compression
+% - Created V_reconstructed_scaled and VFreq_reconstructed (reconstructed data)
+
+%% 1. Overall Compression Statistics
+num_buses = size(V_phasor, 2);
+timestamps = size(V_phasor, 1);
+
+% Calculate compression ratios
+original_size = numel(V_phasor) + numel(VFreq);
+compressed_size = numel(P) + numel(U_prime) + numel(AN) + ...
+                  numel(P_freq) + numel(U_freq_prime) + numel(VFreq_mean);
+compression_ratio = original_size / compressed_size;
+
+% Calculate reduction percentage
+voltage_reduction = (1-N_prime/num_buses)*100;
+freq_reduction = (1-N_prime_freq/num_buses)*100;
+
+%% 2. Global Error Metrics for Voltage Phasors
+
+% Calculate Total Vector Error (TVE) for all samples and PMUs
+tve_values = abs(V_reconstructed_scaled - V_phasor) ./ (abs(V_phasor) + eps) * 100;
+max_tve = max(tve_values(:));
+mean_tve = mean(tve_values(:));
+median_tve = median(tve_values(:));
+std_tve = std(tve_values(:));
+
+% Calculate magnitude error metrics
+mag_orig = abs(V_phasor);
+mag_recon = abs(V_reconstructed_scaled);
+mag_error = mag_recon - mag_orig;
+max_mag_error = max(abs(mag_error(:)));
+mean_mag_error = mean(abs(mag_error(:)));
+rms_mag_error = sqrt(mean(mag_error(:).^2));
+nrmse_mag = rms_mag_error / (max(mag_orig(:)) - min(mag_orig(:)) + eps);
+
+% Calculate angle error metrics (in degrees)
+ang_orig = angle(V_phasor) * 180/pi;
+ang_recon = angle(V_reconstructed_scaled) * 180/pi;
+ang_error = ang_recon - ang_orig;
+% Adjust for phase wrapping (handle -180/+180 boundary)
+ang_error = mod(ang_error + 180, 360) - 180;
+max_ang_error = max(abs(ang_error(:)));
+mean_ang_error = mean(abs(ang_error(:)));
+rms_ang_error = sqrt(mean(ang_error(:).^2));
+
+%% 3. Global Error Metrics for Frequency
+
+% Calculate frequency error metrics
+freq_error = VFreq_reconstructed - VFreq;
+max_freq_error = max(abs(freq_error(:)));
+mean_freq_error = mean(abs(freq_error(:)));
+rms_freq_error = sqrt(mean(freq_error(:).^2));
+nrmse_freq = rms_freq_error / (max(VFreq(:)) - min(VFreq(:)) + eps);
+
+%% 4. Per-PMU Metrics
+
+% Initialize arrays for per-PMU metrics
+pmu_tve_max = zeros(1, num_buses);
+pmu_tve_mean = zeros(1, num_buses);
+pmu_mag_nrmse = zeros(1, num_buses);
+pmu_ang_rms_error = zeros(1, num_buses);
+pmu_freq_nrmse = zeros(1, num_buses);
+
+% Calculate metrics for each PMU
+for pmu = 1:num_buses
+    % Voltage phasor metrics
+    pmu_tve = tve_values(:, pmu);
+    pmu_tve_max(pmu) = max(pmu_tve);
+    pmu_tve_mean(pmu) = mean(pmu_tve);
+    
+    % Magnitude metrics
+    pmu_mag_orig = mag_orig(:, pmu);
+    pmu_mag_recon = mag_recon(:, pmu);
+    pmu_mag_error = pmu_mag_recon - pmu_mag_orig;
+    pmu_mag_rms_error = sqrt(mean(pmu_mag_error.^2));
+    pmu_mag_nrmse(pmu) = pmu_mag_rms_error / (max(pmu_mag_orig) - min(pmu_mag_orig) + eps);
+    
+    % Angle metrics
+    pmu_ang_orig = ang_orig(:, pmu);
+    pmu_ang_recon = ang_recon(:, pmu);
+    pmu_ang_error = pmu_ang_recon - pmu_ang_orig;
+    pmu_ang_error = mod(pmu_ang_error + 180, 360) - 180; % Adjust for phase wrapping
+    pmu_ang_rms_error(pmu) = sqrt(mean(pmu_ang_error.^2));
+    
+    % Frequency metrics
+    pmu_freq_orig = VFreq(:, pmu);
+    pmu_freq_recon = VFreq_reconstructed(:, pmu);
+    pmu_freq_error = pmu_freq_recon - pmu_freq_orig;
+    pmu_freq_rms_error = sqrt(mean(pmu_freq_error.^2));
+    pmu_freq_nrmse(pmu) = pmu_freq_rms_error / (max(pmu_freq_orig) - min(pmu_freq_orig) + eps);
+end
+
+%% 5. Time-based Performance Metrics
+
+% Define analysis windows
+window_size = min(50, floor(timestamps/10)); 
+overlap = floor(window_size/2);
+step = window_size - overlap;
+num_windows = floor((timestamps - window_size) / step) + 1;
+
+% Initialize arrays for time-based metrics
+time_indices = zeros(num_windows, 1);
+tve_over_time = zeros(num_windows, num_buses);
+freq_error_over_time = zeros(num_windows, num_buses);
+
+% Calculate time-based metrics
+for i = 1:num_windows
+    start_idx = (i-1)*step + 1;
+    end_idx = start_idx + window_size - 1;
+    if end_idx > timestamps
+        end_idx = timestamps;
+    end
+    
+    window_indices = start_idx:end_idx;
+    time_indices(i) = mean(window_indices);
+    
+    for pmu = 1:num_buses
+        % TVE for this window and PMU
+        window_tve = tve_values(window_indices, pmu);
+        tve_over_time(i, pmu) = max(window_tve);
+        
+        % Frequency error for this window and PMU
+        window_freq_error = abs(freq_error(window_indices, pmu));
+        freq_error_over_time(i, pmu) = max(window_freq_error);
+    end
+end
+
+% Calculate overall time-based metrics
+max_window_tve = max(tve_over_time(:));
+mean_window_tve = mean(tve_over_time(:));
+max_window_freq_error = max(freq_error_over_time(:));
+mean_window_freq_error = mean(freq_error_over_time(:));
+
+%% 6. Print Results
+
+fprintf('\n========= COMPRESSION EFFICIENCY METRICS =========\n');
+fprintf('Compression Ratio: %.2f:1\n', compression_ratio);
+fprintf('Original Data Size: %d elements\n', original_size);
+fprintf('Compressed Data Size: %d elements\n', compressed_size);
+fprintf('\n');
+fprintf('Voltage phasors compressed using %d out of %d components (%.1f%% reduction)\n', ...
+    N_prime, num_buses, voltage_reduction);
+fprintf('Frequency data compressed using %d out of %d components (%.1f%% reduction)\n', ...
+    N_prime_freq, num_buses, freq_reduction);
+
+fprintf('\n========= RECONSTRUCTION QUALITY METRICS =========\n');
+fprintf('--- Voltage Phasor Metrics ---\n');
+fprintf('Maximum TVE: %.4f%%\n', max_tve);
+fprintf('Mean TVE: %.4f%%\n', mean_tve);
+fprintf('Median TVE: %.4f%%\n', median_tve);
+fprintf('Standard Deviation of TVE: %.4f%%\n', std_tve);
+fprintf('\n');
+
+fprintf('--- Voltage Magnitude Metrics ---\n');
+fprintf('Maximum Magnitude Error: %.6f pu\n', max_mag_error);
+fprintf('Mean Magnitude Error: %.6f pu\n', mean_mag_error);
+fprintf('RMS Magnitude Error: %.6f pu\n', rms_mag_error);
+fprintf('Normalized RMS Magnitude Error: %.6f\n', nrmse_mag);
+fprintf('\n');
+
+fprintf('--- Voltage Angle Metrics ---\n');
+fprintf('Maximum Angle Error: %.6f degrees\n', max_ang_error);
+fprintf('Mean Angle Error: %.6f degrees\n', mean_ang_error);
+fprintf('RMS Angle Error: %.6f degrees\n', rms_ang_error);
+fprintf('\n');
+
+fprintf('--- Frequency Metrics ---\n');
+fprintf('Maximum Frequency Error: %.6f Hz\n', max_freq_error);
+fprintf('Mean Frequency Error: %.6f Hz\n', mean_freq_error);
+fprintf('RMS Frequency Error: %.6f Hz\n', rms_freq_error);
+fprintf('Normalized RMS Frequency Error: %.6f\n', nrmse_freq);
+
+fprintf('\n========= PER-PMU METRICS =========\n');
+for pmu = 1:num_buses
+    fprintf('PMU %d:\n', pmu);
+    fprintf('  Max TVE: %.4f%%\n', pmu_tve_max(pmu));
+    fprintf('  Mean TVE: %.4f%%\n', pmu_tve_mean(pmu));
+    fprintf('  Magnitude NRMSE: %.6f\n', pmu_mag_nrmse(pmu));
+    fprintf('  Angle RMS Error: %.6f degrees\n', pmu_ang_rms_error(pmu));
+    fprintf('  Frequency NRMSE: %.6f\n', pmu_freq_nrmse(pmu));
+    fprintf('\n');
+end
+
+fprintf('========= TIME-BASED METRICS =========\n');
+fprintf('Maximum Window TVE: %.4f%%\n', max_window_tve);
+fprintf('Mean Window TVE: %.4f%%\n', mean_window_tve);
+fprintf('Maximum Window Frequency Error: %.6f Hz\n', max_window_freq_error);
+fprintf('Mean Window Frequency Error: %.6f Hz\n', mean_window_freq_error);
+
+% Save metrics to a MAT file for further analysis
+save('reconstruction_metrics.mat', ...
+     'compression_ratio', 'voltage_reduction', 'freq_reduction', ...
+     'max_tve', 'mean_tve', 'median_tve', 'std_tve', ...
+     'max_mag_error', 'mean_mag_error', 'rms_mag_error', 'nrmse_mag', ...
+     'max_ang_error', 'mean_ang_error', 'rms_ang_error', ...
+     'max_freq_error', 'mean_freq_error', 'rms_freq_error', 'nrmse_freq', ...
+     'pmu_tve_max', 'pmu_tve_mean', 'pmu_mag_nrmse', 'pmu_ang_rms_error', 'pmu_freq_nrmse', ...
+     'max_window_tve', 'mean_window_tve', 'max_window_freq_error', 'mean_window_freq_error');
